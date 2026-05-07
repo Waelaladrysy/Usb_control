@@ -109,10 +109,17 @@ def enable_startup():
             cmd = f'"{exe}" --startup'
         else:
             cmd = f'{exe} --startup'
+        # ── كتابة في HKEY_CURRENT_USER (لا يحتاج Admin) ──────────────────
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_KEY,
                             0, winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, _APP_NAME, 0, winreg.REG_SZ, cmd)
         print(f"✅ Startup registered: {cmd}")
+        # ── التحقق الفوري من نجاح الكتابة ───────────────────────────────
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_KEY,
+                            0, winreg.KEY_READ) as k:
+            val, _ = winreg.QueryValueEx(k, _APP_NAME)
+            if "--startup" not in val:
+                raise ValueError(f"Startup value written without --startup flag: {val}")
         return True
     except Exception as e:
         print(f"⚠️ Could not enable startup: {e}")
@@ -734,12 +741,20 @@ class LoginWindow:
             return
         result = login(username, password)
         if result['success']:
-            # حفظ اسم المستخدم لاستخدامه في التشغيل التلقائي من Startup
+            # ── حفظ اسم المستخدم وتفعيل بدء التشغيل التلقائي ──────────
+            # يجب حفظ last_username و auto_start_enabled قبل enable_startup
+            # حتى يعمل _is_auto_start_enabled عند إقلاع الويندوز
             try:
                 from database_manager import set_setting
                 set_setting('last_username', username)
-            except Exception:
-                pass
+                set_setting('auto_start_enabled', '1')
+                print(f"✅ Session saved: user={username}, auto_start=1")
+            except Exception as e:
+                print(f"⚠️ Could not save session settings: {e}")
+            # ── تسجيل/تحديث Startup Registry ────────────────────────────
+            # نُسجّل دائماً (وليس فقط إذا لم يكن مسجّلاً) لضمان صحة المسار
+            enable_startup()
+            # ── فتح النافذة الرئيسية ─────────────────────────────────────
             self.root.destroy()
             new_root = tk.Tk()
             app = MainWindow(new_root, username)
@@ -784,6 +799,7 @@ class MainWindow:
 
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
 
+        # ── ضمان تسجيل Startup إذا لم يكن مسجلاً (حالة headless) ─────────
         if not is_startup_enabled():
             enable_startup()
             print("✅ Registered in Windows startup")
@@ -905,7 +921,16 @@ class MainWindow:
         entry.bind('<Escape>', lambda e: win.destroy())
 
     def _do_full_exit(self):
-        """إغلاق حقيقي كامل — يحذف من Startup"""
+        """
+        إغلاق حقيقي كامل من قائمة الـ Tray — يطلب كلمة مرور.
+        يحذف من Startup ويمسح علامة التشغيل التلقائي.
+        المرة القادمة سيطلب Login من جديد.
+        """
+        try:
+            from database_manager import set_setting
+            set_setting('auto_start_enabled', '0')
+        except Exception:
+            pass
         disable_startup()
         USBBlocker.restore_autoplay()
         if self.tray_icon:
@@ -1593,7 +1618,7 @@ class MainWindow:
         tk.Label(header, text="Live Device Monitor", font=("Segoe UI", 24, "bold"), 
                 fg=Colors.TEXT_MAIN, bg=Colors.BG_DARK).pack(side=tk.LEFT)
         
-        # ✅ الأزرار: SCAN + DEVICE INFO
+        # ✅ الأزرار: SCAN + DEVICE INFO + DELETE
         btn_frame = tk.Frame(header, bg=Colors.BG_DARK)
         btn_frame.pack(side=tk.RIGHT)
         
@@ -1604,6 +1629,11 @@ class MainWindow:
         HoverButton(btn_frame, text="ℹ️ DEVICE INFO", font=("Segoe UI", 9, "bold"), 
                 bg=Colors.INFO, fg=Colors.BG_DARK, hover_bg='#9900ff', 
                 relief='flat', bd=0, padx=20, command=self.show_device_info).pack(side=tk.RIGHT, padx=5)
+
+        HoverButton(btn_frame, text="🗑️ DELETE", font=("Segoe UI", 9, "bold"),
+                bg=Colors.DANGER, fg=Colors.TEXT_MAIN, hover_bg='#cc0033',
+                relief='flat', bd=0, padx=20,
+                command=self.delete_selected_devices).pack(side=tk.RIGHT, padx=5)
         
         tk.Label(self.main_container, 
                 text="⚠️ AUTO-BLOCK MODE: All unrecognized devices are blocked", 
@@ -1817,6 +1847,177 @@ class MainWindow:
         # ✅ منع التفاعل مع النافذة الرئيسية
         info_dialog.protocol("WM_DELETE_WINDOW", info_dialog.destroy)
 
+    def delete_selected_devices(self):
+        """
+        حذف كامل ونهائي للجهاز من:
+          - قاعدة البيانات (whitelist, blacklist, auto_blocked)
+          - Registry policy (deny list)
+          - Device Manager (تفعيل الجهاز إذا كان معطّلاً)
+          - ذاكرة USBMonitor (يُعامَل كجهاز جديد عند إعادة التوصيل)
+        """
+        if not hasattr(self, 'connected_usb_selection') or not self.connected_usb_selection:
+            messagebox.showwarning("Warning", "⚠️ No devices available!")
+            return
+
+        selected = [(fp, dev) for fp, (var, dev) in self.connected_usb_selection.items() if var.get()]
+        if not selected:
+            messagebox.showwarning("Warning", "⚠️ Please select at least one device first!")
+            return
+
+        if not self.verify_user_password(f"Delete {len(selected)} device(s) permanently"):
+            return
+
+        names = "\n".join(f"  • {dev.get('model', 'Unknown')[:45]}" for _, dev in selected)
+        confirm = messagebox.askyesno(
+            "⚠️  Confirm Permanent Delete",
+            f"This will PERMANENTLY delete {len(selected)} device(s) from ALL lists:\n\n"
+            f"{names}\n\n"
+            "• Removed from: Whitelist, Blacklist, Auto-Blocked\n"
+            "• Block removed from Windows Registry\n"
+            "• Device re-enabled if it was disabled\n"
+            "• On next connection → treated as a brand-new device\n\n"
+            "This cannot be undone. Continue?",
+            icon='warning'
+        )
+        if not confirm:
+            return
+
+        deleted = 0
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            for fp, dev in selected:
+                model   = dev.get('model', 'Unknown')
+                pnp_id  = dev.get('pnp_device_id') or dev.get('pnp_id', '')
+                serial  = dev.get('serial_number', 'N/A')
+                vid     = dev.get('vid', 'N/A')
+                pid     = dev.get('pid', 'N/A')
+                size_gb = dev.get('size_gb', 0)
+
+                # ── 1. تحديد القوائم التي كان فيها الجهاز ───────────────────
+                lists_found = []
+                cursor.execute("SELECT id FROM whitelist    WHERE fingerprint = ?", (fp,))
+                if cursor.fetchone(): lists_found.append("Whitelist")
+                cursor.execute("SELECT id FROM blacklist    WHERE fingerprint = ?", (fp,))
+                if cursor.fetchone(): lists_found.append("Blacklist")
+                cursor.execute("SELECT id FROM auto_blocked WHERE fingerprint = ?", (fp,))
+                if cursor.fetchone(): lists_found.append("Auto-Blocked")
+
+                # ── إذا لم نجد pnp_id في الذاكرة، نبحث في قاعدة البيانات ──
+                if not pnp_id:
+                    cursor.execute("SELECT pnp_device_id FROM auto_blocked WHERE fingerprint = ?", (fp,))
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        pnp_id = row[0]
+                if not pnp_id:
+                    try:
+                        cursor.execute("SELECT pnp_device_id FROM blacklist WHERE fingerprint = ?", (fp,))
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            pnp_id = row[0]
+                    except Exception:
+                        pass
+
+                lists_str = ", ".join(lists_found) if lists_found else "None"
+
+                # ── 2. حذف من كل الجداول ──────────────────────────────────
+                cursor.execute("DELETE FROM whitelist    WHERE fingerprint = ?", (fp,))
+                cursor.execute("DELETE FROM blacklist    WHERE fingerprint = ?", (fp,))
+                cursor.execute("DELETE FROM auto_blocked WHERE fingerprint = ?", (fp,))
+
+                # ── 3. إزالة الحظر من Registry + تفعيل الجهاز ────────────
+                # يجب أن يحدث بعد الحذف من قاعدة البيانات حتى لا يُعاد حظره
+                system_cleaned = False
+                if pnp_id:
+                    try:
+                        # حذف من Registry deny list
+                        from usb_blocker import remove_from_deny_list
+                        remove_from_deny_list(pnp_id)
+
+                        # تعطيل السياسة الاسترجاعية مؤقتاً
+                        try:
+                            winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions")
+                            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions",
+                                0, winreg.KEY_SET_VALUE) as k:
+                                winreg.SetValueEx(k, "DenyDeviceIDsRetroactive", 0, winreg.REG_DWORD, 0)
+                        except Exception:
+                            pass
+
+                        # تفعيل الجهاز عبر PowerShell (يشمل كل عقد الجهاز بالـ serial)
+                        serial_clean = pnp_id.split('\\')[-1].split('&')[0].strip() if '\\' in pnp_id else serial
+                        if serial_clean and serial_clean != 'N/A':
+                            ps_script = f'''
+$serial = "{serial_clean}"
+$devices = Get-PnpDevice | Where-Object {{ $_.InstanceId -like "*$serial*" }}
+foreach ($dev in $devices) {{
+    Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+}}
+Write-Host "Enabled $($devices.Count) device(s) for serial $serial"
+'''
+                            import subprocess as _sp
+                            _sp.run(['powershell', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                                     '-Command', ps_script],
+                                    capture_output=True, text=True, timeout=20)
+
+                        # إعادة السياسة الاسترجاعية
+                        try:
+                            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions",
+                                0, winreg.KEY_SET_VALUE) as k:
+                                winreg.SetValueEx(k, "DenyDeviceIDsRetroactive", 0, winreg.REG_DWORD, 1)
+                        except Exception:
+                            pass
+
+                        # pnputil scan
+                        _sp.run('pnputil /scan-devices', shell=True,
+                                capture_output=True, text=True, timeout=10)
+
+                        system_cleaned = True
+                        print(f"🔓 System-level block removed for: {model}")
+                    except Exception as e:
+                        print(f"⚠️ System cleanup warning: {e}")
+
+                # ── 4. إزالة من ذاكرة USBMonitor ─────────────────────────
+                if pnp_id and hasattr(self.usb_monitor, 'known_pnp_ids'):
+                    self.usb_monitor.known_pnp_ids.discard(pnp_id)
+
+                # ── 5. تسجيل في Audit Logs ──────────────────────────────
+                log_event(
+                    event_type         = "DEVICE_PERMANENTLY_DELETED",
+                    device_fingerprint = fp,
+                    device_model       = model,
+                    result             = "Success",
+                    user               = self.username,
+                    details            = (
+                        f"Permanently deleted from: [{lists_str}]. "
+                        f"Serial: {serial} | VID: {vid} | PID: {pid} | Size: {size_gb} GB | "
+                        f"PnP: {pnp_id or 'N/A'} | "
+                        f"System block removed: {'Yes' if system_cleaned else 'No (pnp_id unavailable)'}. "
+                        f"Device will be treated as brand-new on next connection."
+                    )
+                )
+                deleted += 1
+                print(f"🗑️ Permanently deleted: {model} | FP: {fp[:14]}... | Was in: [{lists_str}] | System cleaned: {system_cleaned}")
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            messagebox.showerror("Delete Error", f"❌ Failed to delete:\n{e}")
+            return
+
+        sys_note = "\n• Block removed from Windows and device re-enabled" if deleted > 0 else ""
+        messagebox.showinfo(
+            "✅  Delete Complete",
+            f"{deleted} device(s) permanently removed from all lists.{sys_note}\n\n"
+            "On next connection they will be treated as new devices\n"
+            "and added to Auto-Blocked automatically."
+        )
+        self.show_connected_usb()
+
     def show_whitelist(self):
         self.current_view = 'whitelist'
         self.clear_view()
@@ -1957,9 +2158,6 @@ class MainWindow:
 
         bl_search_var.trace_add('write', _on_bl_search)
         _render_bl(all_bl)
-        for i in range(6): table_frame.grid_columnconfigure(i, weight=1)
-        for c, val in enumerate(values):
-            tk.Label(table_frame, text=str(val), fg=Colors.TEXT_MAIN, bg=bg_row).grid(row=r, column=c, sticky='nsew', ipady=5, padx=5)
         for i in range(6): table_frame.grid_columnconfigure(i, weight=1)
 
     def show_auto_blocked(self):
@@ -2106,6 +2304,7 @@ class MainWindow:
         tree.tag_configure('autoplay',  background='#0d1020', foreground='#00d1ff')
         tree.tag_configure('auth',      background='#1a1208', foreground='#ffcc44')
         tree.tag_configure('system',    background='#0f0f18', foreground='#aa88ff')
+        tree.tag_configure('deleted',   background='#1a0f00', foreground='#ff8800')
         tree.tag_configure('default',   background=Colors.BG_CARD, foreground=Colors.TEXT_MAIN)
 
         # ── تحميل البيانات ────────────────────────────────────────────────
@@ -2121,6 +2320,8 @@ class MainWindow:
 
         def _get_tag(event_type: str) -> str:
             et = (event_type or "").upper()
+            if "PERMANENTLY_DELETED" in et:
+                return 'deleted'
             if any(k in et for k in ("BLOCK", "DENY", "FAILED")):
                 return 'blocked'
             if any(k in et for k in ("ALLOW", "WHITELIST")):
@@ -2162,7 +2363,7 @@ class MainWindow:
         # ── شريط الحالة ──────────────────────────────────────────────────
         tk.Label(table_wrap,
                  text=f"Showing last {len(all_logs)} entries   "
-                      "■ Blocked  ■ Allowed  ■ AutoPlay  ■ Auth  ■ System",
+                      "■ Blocked  ■ Allowed  ■ AutoPlay  ■ Auth  ■ System  ■ Deleted",
                  font=("Segoe UI", 8), fg=Colors.TEXT_DIM,
                  bg=Colors.BG_DARK).pack(anchor='w', pady=(6, 0))
 
@@ -2306,9 +2507,23 @@ class MainWindow:
 
     def logout(self):
         if messagebox.askyesno("Confirm Logout", "Are you sure you want to terminate the secure session?"):
+            # ── Logout يُعيد البرنامج لحالة "يحتاج Login" ─────────────────
+            try:
+                from database_manager import set_setting
+                set_setting('auto_start_enabled', '0')
+            except Exception:
+                pass
+            disable_startup()
             self.usb_monitor.stop()
+            USBBlocker.restore_autoplay()
+            if self.tray_icon:
+                try: self.tray_icon.stop()
+                except Exception: pass
             self.root.destroy()
-            main()
+            # ── فتح شاشة Login من جديد ──────────────────────────────────
+            new_root = tk.Tk()
+            LoginWindow(new_root)
+            new_root.mainloop()
 
     # ==================== دوال الإجراءات ====================
     def get_connected_usb_devices():
@@ -2696,9 +2911,10 @@ def _run_headless():
     """تشغيل في الخلفية بدون نافذة — يُستدعى من Windows Startup"""
     try:
         from database_manager import get_setting
-        username = get_setting('last_username') or "admin"
+        username = get_setting('last_username', '').strip() or "admin"
     except Exception:
         username = "admin"
+    print(f"🔇 Headless startup as: {username}")
     root = tk.Tk()
     root.withdraw()
     app = MainWindow(root, username, start_hidden=True)
@@ -2709,6 +2925,19 @@ def _run_login():
     root = tk.Tk()
     app  = LoginWindow(root)
     root.mainloop()
+
+def _is_auto_start_enabled() -> bool:
+    """
+    هل البرنامج مُفعَّل للتشغيل التلقائي بدون Login؟
+    يُرجع True فقط إذا قام المستخدم بـ Login ناجح مسبقاً
+    ولم يقم بـ Logout أو Exit.
+    """
+    try:
+        from database_manager import get_setting
+        return get_setting('auto_start_enabled', '0') == '1'
+    except Exception:
+        return False
+
 
 def main():
     if not _acquire_mutex():
@@ -2725,9 +2954,12 @@ def main():
             pass
         sys.exit(0)
 
-    if "--startup" in sys.argv:
+    if "--startup" in sys.argv and _is_auto_start_enabled():
+        # ── تشغيل تلقائي من Windows Startup بعد Login ناجح سابق ─────────
+        # بدون نافذة، بدون CMD، مباشرة في الخلفية
         _run_headless()
     else:
+        # ── تشغيل عادي أو بعد Logout/Exit → يطلب Login ─────────────────
         _run_login()
 
 if __name__ == "__main__":
